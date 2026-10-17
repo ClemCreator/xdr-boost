@@ -4,14 +4,19 @@ import Carbon.HIToolbox
 
 // MARK: - Kill switch: `xdr-boost --kill` terminates any running instance
 if CommandLine.arguments.contains("--kill") || CommandLine.arguments.contains("-k") {
+    // Match the process name exactly (not `pkill -f`, which also hits this very process
+    // and anything with "xdr-boost" in its arguments, like an editor open on the repo)
     let pipe = Pipe()
     let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-    proc.arguments = ["-f", "xdr-boost"]
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    proc.arguments = ["-x", "xdr-boost"]
     proc.standardOutput = pipe
-    proc.standardError = pipe
     try? proc.run()
     proc.waitUntilExit()
+    let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    for pid in output.split(separator: "\n").compactMap({ pid_t($0) }) where pid != getpid() {
+        kill(pid, SIGTERM)
+    }
     fputs("All xdr-boost instances killed\n", stderr)
     exit(0)
 }
