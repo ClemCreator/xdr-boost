@@ -188,10 +188,7 @@ class XDRApp: NSObject, NSApplicationDelegate {
                     window.orderFrontRegardless()
                     fputs("Watchdog — trigger restored\n", stderr)
                 }
-                if !self.gammaIsBoosted() {
-                    self.reapplyGamma()
-                    fputs("Watchdog — gamma restored\n", stderr)
-                }
+                self.refreshGamma()
             } else {
                 // Trigger is gone (nil) — need to fully recreate
                 self.isActive = false
@@ -224,15 +221,14 @@ class XDRApp: NSObject, NSApplicationDelegate {
                 }
             }
         } else {
-            boostLevel = min(boostLevel, Double(maxEDR))
-            if !gammaIsBoosted() { reapplyGamma() }
+            refreshGamma()
         }
     }
 
     @objc func handleSpaceChange() {
         guard isActive, let window = triggerWindow else { return }
         window.orderFrontRegardless()
-        if !gammaIsBoosted() { reapplyGamma() }
+        refreshGamma()
     }
 
     // MARK: - Gamma boost
@@ -246,8 +242,18 @@ class XDRApp: NSObject, NSApplicationDelegate {
     // macOS restores the ColorSync table automatically when the process exits — even on
     // SIGKILL — so the screen can never get stuck boosted.
 
-    // Table values act on the gamma-encoded signal; scale so linear light = boostLevel.
-    var gammaGain: Float { Float(pow(boostLevel, 1.0 / 2.2)) }
+    // Linear boost actually applied: the chosen level, capped to the panel's current EDR
+    // headroom. Going past it would push SDR white beyond what the backlight can show
+    // and clip highlights. Headroom shrinks as the brightness keys go up.
+    var effectiveBoost: Double {
+        let headroom = Double(xdrScreen()?.maximumExtendedDynamicRangeColorComponentValue ?? 0)
+        return headroom > 1.0 ? min(boostLevel, headroom) : boostLevel
+    }
+
+    // Table values act on the gamma-encoded signal; scale so linear light = effectiveBoost.
+    var gammaGain: Float { Float(pow(effectiveBoost, 1.0 / 2.2)) }
+    var appliedGain: Float = 0
+    var headroomDropSince: Date?
 
     func readGamma() -> GammaTable? {
         let capacity = CGDisplayGammaTableCapacity(displayID)
@@ -277,24 +283,53 @@ class XDRApp: NSObject, NSApplicationDelegate {
         guard let t = originalGamma else { return }
         let k = gammaGain
         var r = scaled(t.r, by: k), g = scaled(t.g, by: k), b = scaled(t.b, by: k)
-        CGSetDisplayTransferByTable(displayID, UInt32(r.count), &r, &g, &b)
+        if CGSetDisplayTransferByTable(displayID, UInt32(r.count), &r, &g, &b) == .success {
+            appliedGain = k
+        }
     }
 
     func gammaIsBoosted() -> Bool {
         guard let t = originalGamma, let cur = readGamma() else { return false }
-        return abs((cur.r.last ?? 0) - (t.r.last ?? 0) * gammaGain) < 0.01
+        return abs((cur.r.last ?? 0) - (t.r.last ?? 0) * appliedGain) < 0.01
+    }
+
+    // Keep the table correct: re-apply if macOS reset it, or if the headroom moved
+    // enough to change the gain. Rises apply right away; drops only once they've lasted
+    // a couple of seconds, so a brief dip (e.g. mid Space switch) can't pulse the boost.
+    func refreshGamma() {
+        if !gammaIsBoosted() {
+            reapplyGamma()
+            fputs("Gamma restored\n", stderr)
+        } else if gammaGain > appliedGain + 0.005 {
+            headroomDropSince = nil
+            applyGamma()
+        } else if gammaGain < appliedGain - 0.005 {
+            let since = headroomDropSince ?? Date()
+            headroomDropSince = since
+            if Date().timeIntervalSince(since) >= 2 {
+                headroomDropSince = nil
+                applyGamma()
+                fputs("Headroom dropped — boost now \(String(format: "%.2f", effectiveBoost))x\n", stderr)
+            }
+        } else {
+            headroomDropSince = nil
+        }
     }
 
     // macOS replaced our table (wake, ColorSync/calibration change) — adopt its new
-    // table as the baseline and boost on top of it.
+    // table as the baseline and boost on top of it. Only adopt tables that look
+    // unboosted, so a boosted table can never become the baseline and compound.
     func reapplyGamma() {
-        originalGamma = readGamma()
+        if let cur = readGamma(), (cur.r + cur.g + cur.b).allSatisfy({ $0 <= 1.001 }) {
+            originalGamma = cur
+        }
         applyGamma()
     }
 
     func restoreGamma() {
         if originalGamma != nil { CGDisplayRestoreColorSyncSettings() }
         originalGamma = nil
+        appliedGain = 0
     }
 
     // MARK: - Toggle
@@ -362,7 +397,7 @@ class XDRApp: NSObject, NSApplicationDelegate {
         isActive = true
         statusItem.button?.title = "☀︎"
         toggleItem.title = "Turn Off"
-        fputs("XDR ON — \(boostLevel)x\n", stderr)
+        fputs("XDR ON — \(boostLevel)x (applied \(String(format: "%.2f", effectiveBoost))x)\n", stderr)
     }
 
     func deactivate() {
