@@ -2,10 +2,10 @@ import Cocoa
 import MetalKit
 import Carbon.HIToolbox
 
-// MARK: - Kill switch: `xdr-boost --kill` terminates any running instance
-if CommandLine.arguments.contains("--kill") || CommandLine.arguments.contains("-k") {
-    // Match the process name exactly (not `pkill -f`, which also hits this very process
-    // and anything with "xdr-boost" in its arguments, like an editor open on the repo)
+// Other running xdr-boost processes. Matches the process name exactly (not `pkill -f`,
+// which also hits this very process and anything with "xdr-boost" in its arguments,
+// like an editor open on the repo).
+func otherInstances() -> [pid_t] {
     let pipe = Pipe()
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -14,10 +14,21 @@ if CommandLine.arguments.contains("--kill") || CommandLine.arguments.contains("-
     try? proc.run()
     proc.waitUntilExit()
     let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    for pid in output.split(separator: "\n").compactMap({ pid_t($0) }) where pid != getpid() {
+    return output.split(separator: "\n").compactMap { pid_t($0) }.filter { $0 != getpid() }
+}
+
+// MARK: - Kill switch: `xdr-boost --kill` terminates any running instance
+if CommandLine.arguments.contains("--kill") || CommandLine.arguments.contains("-k") {
+    for pid in otherInstances() {
         kill(pid, SIGTERM)
     }
     fputs("All xdr-boost instances killed\n", stderr)
+    exit(0)
+}
+
+// Two instances would fight over the gamma table (and the hotkey), so only run one.
+if !otherInstances().isEmpty {
+    fputs("xdr-boost is already running (use the menu bar icon, or `xdr-boost --kill`)\n", stderr)
     exit(0)
 }
 
