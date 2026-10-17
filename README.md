@@ -11,12 +11,14 @@ Unlocks the full brightness of your Liquid Retina XDR display beyond the standar
 - No flicker when switching Spaces, swiping between desktops, or opening Mission Control
 - Screenshots and screen recordings look normal — the boost isn't captured
 - Never clips highlights — the boost is capped to the headroom the display actually has at the current brightness
-- Menu bar icon with brightness presets (1.5x, 2.0x, 3.0x, 4.0x)
+- Menu bar panel with an on/off switch, a 1x–4x slider, presets, and a live headroom meter
+- Options: turn on when the app starts, launch at login, only while charging, turn off on low battery
+- Remembers your boost level between launches
 - Global keyboard shortcut (**Ctrl+Option+Cmd+V**) to toggle from anywhere
 - Survives sleep/wake, lid close/open, and lock/unlock — brightness auto-restores
 - Starts with XDR off — rebooting always gives you a normal screen
 - Emergency kill switch (`xdr-boost --kill`) if anything goes wrong
-- Single binary, no dependencies, ~350 lines of Swift
+- Single binary, no dependencies, ~700 lines of Swift
 - Launch agent for auto-start on login
 
 ## How it works
@@ -75,12 +77,20 @@ xdr-boost
 
 # Run with custom boost level
 xdr-boost 3.0
+
+# Start with the boost already on
+xdr-boost 4.0 --on
 ```
 
-Click the **☀** icon in your menu bar to:
-- Toggle XDR brightness on/off
-- Choose brightness level (1.5x, 2.0x, 3.0x, 4.0x)
-- Quit
+Click the **☀** icon in your menu bar to open the panel:
+- Switch XDR brightness on/off
+- Pick a level with the slider or the 1.5x / 2x / 3x / 4x presets
+- See how much headroom the display has right now (at high brightness macOS gives less, and the boost is capped to it so highlights never clip)
+- Options:
+  - **Turn on when the app starts** — no need to switch it on after every login
+  - **Launch at login** — writes the launch agent for you (takes effect at the next login)
+  - **Only while charging** — pauses on battery, resumes when you plug in
+  - **Turn off below 20% battery** — pauses when the battery is low, resumes when you plug in
 
 ### Keyboard shortcut
 
@@ -98,7 +108,7 @@ xdr-boost --kill
 pkill xdr-boost
 ```
 
-The app always starts with XDR **off** — you have to manually turn it on. So rebooting will always give you a normal screen.
+By default the app starts with XDR **off** — you have to manually turn it on. So rebooting will always give you a normal screen (unless you enabled "Turn on when the app starts").
 
 ### Sleep, lid close, and lock screen
 
