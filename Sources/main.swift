@@ -1,11 +1,12 @@
 import Cocoa
 import MetalKit
 import Carbon.HIToolbox
+import IOKit.ps
 
-// MARK: - Kill switch: `xdr-boost --kill` terminates any running instance
-if CommandLine.arguments.contains("--kill") || CommandLine.arguments.contains("-k") {
-    // Match the process name exactly (not `pkill -f`, which also hits this very process
-    // and anything with "xdr-boost" in its arguments, like an editor open on the repo)
+// Other running xdr-boost processes. Matches the process name exactly (not `pkill -f`,
+// which also hits this very process and anything with "xdr-boost" in its arguments,
+// like an editor open on the repo).
+func otherInstances() -> [pid_t] {
     let pipe = Pipe()
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -14,10 +15,21 @@ if CommandLine.arguments.contains("--kill") || CommandLine.arguments.contains("-
     try? proc.run()
     proc.waitUntilExit()
     let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    for pid in output.split(separator: "\n").compactMap({ pid_t($0) }) where pid != getpid() {
+    return output.split(separator: "\n").compactMap { pid_t($0) }.filter { $0 != getpid() }
+}
+
+// MARK: - Kill switch: `xdr-boost --kill` terminates any running instance
+if CommandLine.arguments.contains("--kill") || CommandLine.arguments.contains("-k") {
+    for pid in otherInstances() {
         kill(pid, SIGTERM)
     }
     fputs("All xdr-boost instances killed\n", stderr)
+    exit(0)
+}
+
+// Two instances would fight over the gamma table (and the hotkey), so only run one.
+if !otherInstances().isEmpty {
+    fputs("xdr-boost is already running (use the menu bar icon, or `xdr-boost --kill`)\n", stderr)
     exit(0)
 }
 
@@ -39,15 +51,25 @@ class Renderer: NSObject, MTKViewDelegate {
 
 typealias GammaTable = (r: [CGGammaValue], g: [CGGammaValue], b: [CGGammaValue])
 
-class XDRApp: NSObject, NSApplicationDelegate {
+class XDRApp: NSObject, NSApplicationDelegate, ObservableObject {
+    static let prefs = UserDefaults(suiteName: "com.xdr-boost")!
+    static let maxLevel = 4.0
+    static let lowBatteryPercent = 20
+    static let agentURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents/com.xdr-boost.agent.plist")
+
     var statusItem: NSStatusItem!
+    var popover: NSPopover!
     var triggerWindow: NSWindow?
     var triggerView: MTKView?
     var device: MTLDevice!
     var triggerRenderer: Renderer?
-    var isActive = false
-    var shouldBeActive = false  // tracks user intent across sleep/lock cycles
-    var boostLevel: Double = 2.0
+    @Published var isActive = false { didSet { updateStatusIcon() } }
+    @Published var shouldBeActive = false  // tracks user intent across sleep/lock cycles
+    @Published var boostLevel: Double { didSet { Self.prefs.set(boostLevel, forKey: "level") } }
+    @Published var appliedBoost: Double = 1.0  // linear boost currently on screen
+    @Published var headroom: Double = 1.0      // panel's current EDR headroom
+    @Published var pauseReason: String? { didSet { updateStatusIcon() } }  // power options holding it off
     var maxEDR: CGFloat = 1.0
     var hotkeyRef: EventHotKeyRef?
     var watchdogTimer: Timer?
@@ -55,9 +77,28 @@ class XDRApp: NSObject, NSApplicationDelegate {
     var displayID: CGDirectDisplayID = CGMainDisplayID()
     var originalGamma: GammaTable?  // display's own (calibrated) table, captured before boosting
 
-    var toggleItem: NSMenuItem!
-    var shortcutItem: NSMenuItem!
-    var boostItems: [NSMenuItem] = []
+    // Settings (persisted)
+    @Published var turnOnAtLaunch: Bool { didSet { Self.prefs.set(turnOnAtLaunch, forKey: "turnOnAtLaunch") } }
+    @Published var onlyWhileCharging: Bool {
+        didSet { Self.prefs.set(onlyWhileCharging, forKey: "onlyWhileCharging"); enforcePowerPolicy() }
+    }
+    @Published var lowBatteryOff: Bool {
+        didSet { Self.prefs.set(lowBatteryOff, forKey: "lowBatteryOff"); enforcePowerPolicy() }
+    }
+    @Published var launchAtLogin = FileManager.default.fileExists(atPath: XDRApp.agentURL.path)
+
+    // Power state
+    @Published var onBattery = false
+    @Published var batteryPercent: Int?  // nil on Macs without a battery
+
+    override init() {
+        let p = Self.prefs
+        boostLevel = p.object(forKey: "level") as? Double ?? 2.0
+        turnOnAtLaunch = p.bool(forKey: "turnOnAtLaunch")
+        onlyWhileCharging = p.bool(forKey: "onlyWhileCharging")
+        lowBatteryOff = p.bool(forKey: "lowBatteryOff")
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let dev = MTLCreateSystemDefaultDevice() else {
@@ -73,9 +114,13 @@ class XDRApp: NSObject, NSApplicationDelegate {
             boostLevel = min(max(v, 1.0), Double(maxEDR))
         }
 
+        updatePower()
         setupStatusBar()
         registerGlobalHotkey()
         observeSleepWake()
+        if turnOnAtLaunch || CommandLine.arguments.contains("--on") {
+            setEnabled(true)
+        }
         fputs("XDR Boost ready — click menu bar icon or press Ctrl+Option+Cmd+V to toggle\n", stderr)
         fputs("Emergency kill: run `xdr-boost --kill` or press Ctrl+Option+Cmd+V\n", stderr)
         fputs("Max EDR: \(maxEDR)x\n", stderr)
@@ -121,55 +166,6 @@ class XDRApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Status Bar
-
-    func setupStatusBar() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            button.title = "☀"
-        }
-
-        let menu = NSMenu()
-
-        toggleItem = NSMenuItem(title: "Turn On", action: #selector(toggleXDR), keyEquivalent: "b")
-        toggleItem.target = self
-        menu.addItem(toggleItem)
-
-        shortcutItem = NSMenuItem(title: "Shortcut: Ctrl+Option+Cmd+V", action: nil, keyEquivalent: "")
-        shortcutItem.isEnabled = false
-        menu.addItem(shortcutItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let levelHeader = NSMenuItem(title: "Brightness Level", action: nil, keyEquivalent: "")
-        levelHeader.isEnabled = false
-        menu.addItem(levelHeader)
-
-        let levels: [(String, Double)] = [
-            ("1.5x — Subtle", 1.5),
-            ("2.0x — Normal", 2.0),
-            ("3.0x — Bright", 3.0),
-            ("4.0x — Max", 4.0),
-        ]
-
-        for (title, level) in levels {
-            let item = NSMenuItem(title: title, action: #selector(setBoostLevel(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = Int(level * 100)
-            item.state = (level == boostLevel) ? .on : .off
-            menu.addItem(item)
-            boostItems.append(item)
-        }
-
-        menu.addItem(NSMenuItem.separator())
-
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
-
-        statusItem.menu = menu
-    }
-
     // MARK: - Watchdog & Display Changes
 
     func observeSleepWake() {
@@ -186,7 +182,10 @@ class XDRApp: NSObject, NSApplicationDelegate {
         // Watchdog: every second, check if XDR should be on but the trigger window is
         // dead or macOS reset the gamma table (sleep/wake, lid, lock, ColorSync changes)
         watchdogTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self, self.shouldBeActive else { return }
+            guard let self = self else { return }
+            self.updatePower()
+            self.updateHeadroom()
+            guard self.shouldBeActive, !self.enforcePowerPolicy() else { return }
 
             if let window = self.triggerWindow {
                 if !window.isVisible {
@@ -208,6 +207,7 @@ class XDRApp: NSObject, NSApplicationDelegate {
 
     @objc func handleDisplayChange() {
         maxEDR = xdrScreen()?.maximumPotentialExtendedDynamicRangeColorComponentValue ?? 1.0
+        updateHeadroom()
         guard isActive else { return }
         guard let screen = xdrScreen(), let window = triggerWindow else {
             // XDR panel went away (e.g. lid closed with external display) — watchdog brings it back
@@ -290,6 +290,7 @@ class XDRApp: NSObject, NSApplicationDelegate {
         var r = scaled(t.r, by: k), g = scaled(t.g, by: k), b = scaled(t.b, by: k)
         if CGSetDisplayTransferByTable(displayID, UInt32(r.count), &r, &g, &b) == .success {
             appliedGain = k
+            appliedBoost = pow(Double(k), 2.2)
         }
     }
 
@@ -335,38 +336,112 @@ class XDRApp: NSObject, NSApplicationDelegate {
         if originalGamma != nil { CGDisplayRestoreColorSyncSettings() }
         originalGamma = nil
         appliedGain = 0
+        appliedBoost = 1.0
+    }
+
+    func updateHeadroom() {
+        let h = Double(xdrScreen()?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0)
+        if abs(h - headroom) > 0.01 { headroom = h }
+    }
+
+    // MARK: - Power options
+
+    func updatePower() {
+        let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+        let source = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String?
+        var percent: Int?
+        let list = IOPSCopyPowerSourcesList(info).takeRetainedValue() as [CFTypeRef]
+        for ps in list {
+            guard let desc = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
+                  desc[kIOPSTypeKey] as? String == kIOPSInternalBatteryType,
+                  let cur = desc[kIOPSCurrentCapacityKey] as? Int,
+                  let max = desc[kIOPSMaxCapacityKey] as? Int, max > 0 else { continue }
+            percent = cur * 100 / max
+        }
+        let battery = source == kIOPSBatteryPowerValue
+        if battery != onBattery { onBattery = battery }
+        if percent != batteryPercent { batteryPercent = percent }
+    }
+
+    var powerBlock: String? {
+        guard onBattery else { return nil }
+        if onlyWhileCharging { return "Paused on battery" }
+        if lowBatteryOff, let p = batteryPercent, p <= Self.lowBatteryPercent { return "Paused — battery at \(p)%" }
+        return nil
+    }
+
+    // Holds the boost off while a power option says so, and lets the watchdog bring it
+    // back once it doesn't. Returns true while blocked.
+    @discardableResult
+    func enforcePowerPolicy() -> Bool {
+        guard shouldBeActive, let reason = powerBlock else {
+            if pauseReason != nil { pauseReason = nil }
+            return false
+        }
+        if pauseReason != reason { pauseReason = reason }
+        if isActive {
+            deactivate()
+            fputs("\(reason)\n", stderr)
+        }
+        return true
+    }
+
+    // MARK: - Launch at login
+    //
+    // Writes the same launch agent `make launch-agent` installs. It isn't loaded right
+    // away (that would start a second copy), it just takes effect at the next login.
+
+    func setLaunchAtLogin(_ on: Bool) {
+        let url = Self.agentURL
+        if on, let exe = Bundle.main.executableURL?.resolvingSymlinksInPath().path {
+            let plist: [String: Any] = [
+                "Label": "com.xdr-boost",
+                "ProgramArguments": [exe],
+                "RunAtLoad": true,
+                "KeepAlive": ["SuccessfulExit": false],
+                "ProcessType": "Interactive",
+            ]
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+                try? data.write(to: url)
+            }
+        } else if !on {
+            try? FileManager.default.removeItem(at: url)
+        }
+        launchAtLogin = FileManager.default.fileExists(atPath: url.path)
     }
 
     // MARK: - Toggle
 
     @objc func toggleXDR() {
-        if isActive {
-            shouldBeActive = false
+        setEnabled(!shouldBeActive)
+    }
+
+    func setEnabled(_ on: Bool) {
+        shouldBeActive = on
+        if !on {
+            pauseReason = nil
             deactivate()
-        } else {
-            shouldBeActive = true
+        } else if !enforcePowerPolicy() {
             activate()
         }
     }
 
-    @objc func setBoostLevel(_ sender: NSMenuItem) {
-        boostLevel = min(Double(sender.tag) / 100.0, Double(maxEDR))
-        for item in boostItems {
-            item.state = (item.tag == sender.tag) ? .on : .off
-        }
+    // Picking a level also turns the boost on, like the presets in the old menu did.
+    func setLevel(_ level: Double) {
+        boostLevel = min(max(level, 1.0), Double(maxEDR))
         if isActive {
             // Update in-place — no teardown, no flash
             applyGamma()
-        } else {
-            shouldBeActive = true
-            activate()
+        } else if !shouldBeActive {
+            setEnabled(true)
         }
     }
 
     // MARK: - XDR trigger + boost
 
     func activate() {
-        guard let screen = xdrScreen() else { return }
+        guard !isActive, let screen = xdrScreen() else { return }
         displayID = screenID(screen)
 
         // 1×1 pt EDR window in the bottom-left corner (hidden under the panel's rounded
@@ -400,8 +475,6 @@ class XDRApp: NSObject, NSApplicationDelegate {
         applyGamma()
 
         isActive = true
-        statusItem.button?.title = "☀︎"
-        toggleItem.title = "Turn Off"
         fputs("XDR ON — \(boostLevel)x (applied \(String(format: "%.2f", effectiveBoost))x)\n", stderr)
     }
 
@@ -413,8 +486,6 @@ class XDRApp: NSObject, NSApplicationDelegate {
         triggerRenderer = nil
 
         isActive = false
-        statusItem.button?.title = "☀"
-        toggleItem.title = "Turn On"
         fputs("XDR OFF\n", stderr)
     }
 
