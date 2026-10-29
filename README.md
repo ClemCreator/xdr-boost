@@ -2,6 +2,12 @@
 
 Free and open-source XDR brightness booster for MacBook Pro. Like [Vivid](https://www.getvivid.app/), but free.
 
+> **About this fork.** This is [ClemCreator/xdr-boost](https://github.com/ClemCreator/xdr-boost), a fork of [levelsio/xdr-boost](https://github.com/levelsio/xdr-boost) that merges the upstream pull requests and issue fixes that were still pending there:
+> [#15](https://github.com/levelsio/xdr-boost/pull/15) gamma-table boost (no more flicker in Mission Control, Spaces and Stage Manager — fixes [#8](https://github.com/levelsio/xdr-boost/issues/8), [#10](https://github.com/levelsio/xdr-boost/issues/10), [#12](https://github.com/levelsio/xdr-boost/issues/12)),
+> [#16](https://github.com/levelsio/xdr-boost/pull/16) menu bar control panel with saved settings and power options,
+> the `.app` bundle / DMG build from [#6](https://github.com/levelsio/xdr-boost/pull/6),
+> and the `sudo make install` fix from [#5](https://github.com/levelsio/xdr-boost/issues/5).
+
 Unlocks the full brightness of your Liquid Retina XDR display beyond the standard SDR limit. Your MacBook Pro can go up to 1600 nits — this tool lets you use it.
 
 ## Features
@@ -42,31 +48,49 @@ macOS restores the original gamma table automatically whenever xdr-boost exits �
 ## Install
 
 ```bash
-git clone https://github.com/levelsio/xdr-boost.git
+git clone https://github.com/ClemCreator/xdr-boost.git
 cd xdr-boost
 make build
+.build/xdr-boost
 ```
 
-The binary will be at `.build/xdr-boost`.
+The binary will be at `.build/xdr-boost`. No `sudo` is needed to build or run it.
 
-### Install to PATH
+### App bundle (optional)
 
 ```bash
-sudo make install
+make app    # builds ".build/XDR Boost.app" — drag it to /Applications
+make dmg    # builds .build/XDR-Boost.dmg
+```
+
+The first time you open the app, right-click it and choose **Open** (it is ad-hoc signed, not notarized).
+
+### Install to PATH (optional)
+
+```bash
+make build          # as your normal user
+sudo make install   # only copies the binary to /usr/local/bin
+```
+
+`make install` deliberately doesn't build, so `sudo` never touches `.build/`. If you'd rather avoid `sudo` entirely, install somewhere you own:
+
+```bash
+make install PREFIX=~/.local   # puts it in ~/.local/bin
 ```
 
 ### Start on login
 
+Either turn on **Launch at login** in the menu bar panel, or install the launch agent (needs the binary on your PATH, see above):
+
 ```bash
-sudo make install
-make launch-agent
+make launch-agent   # no sudo — it only writes to ~/Library/LaunchAgents
 ```
 
 ### Uninstall
 
 ```bash
-make remove-agent
-sudo make uninstall
+make remove-agent     # as your user
+sudo make uninstall   # if you installed to /usr/local/bin
 ```
 
 ## Usage
