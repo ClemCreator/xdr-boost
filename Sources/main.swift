@@ -110,7 +110,7 @@ class XDRApp: NSObject, NSApplicationDelegate, ObservableObject {
         }
         maxEDR = screen.maximumPotentialExtendedDynamicRangeColorComponentValue
 
-        if CommandLine.arguments.count > 1, let v = Double(CommandLine.arguments[1]) {
+        if let v = CommandLine.arguments.dropFirst().compactMap(Double.init).first {
             boostLevel = min(max(v, 1.0), Double(maxEDR))
         }
 
@@ -258,6 +258,7 @@ class XDRApp: NSObject, NSApplicationDelegate, ObservableObject {
     // Table values act on the gamma-encoded signal; scale so linear light = effectiveBoost.
     var gammaGain: Float { Float(pow(effectiveBoost, 1.0 / 2.2)) }
     var appliedGain: Float = 0
+    var appliedCapped = false  // false when the table went up before the panel reported any headroom
     var headroomDropSince: Date?
 
     func readGamma() -> GammaTable? {
@@ -291,6 +292,7 @@ class XDRApp: NSObject, NSApplicationDelegate, ObservableObject {
         if CGSetDisplayTransferByTable(displayID, UInt32(r.count), &r, &g, &b) == .success {
             appliedGain = k
             appliedBoost = pow(Double(k), 2.2)
+            appliedCapped = (xdrScreen()?.maximumExtendedDynamicRangeColorComponentValue ?? 0) > 1.0
         }
     }
 
@@ -310,6 +312,14 @@ class XDRApp: NSObject, NSApplicationDelegate, ObservableObject {
             headroomDropSince = nil
             applyGamma()
         } else if gammaGain < appliedGain - 0.005 {
+            // Right after activation the panel wasn't in EDR mode yet, so the first table
+            // went up uncapped. Now that the real headroom is known, cap without the delay
+            // instead of clipping highlights for two seconds.
+            if !appliedCapped {
+                applyGamma()
+                fputs("Headroom known — boost capped to \(String(format: "%.2f", effectiveBoost))x\n", stderr)
+                return
+            }
             let since = headroomDropSince ?? Date()
             headroomDropSince = since
             if Date().timeIntervalSince(since) >= 2 {
@@ -319,6 +329,10 @@ class XDRApp: NSObject, NSApplicationDelegate, ObservableObject {
             }
         } else {
             headroomDropSince = nil
+            // Gain matches at a real headroom — the uncapped-at-activation case is over.
+            if !appliedCapped, (xdrScreen()?.maximumExtendedDynamicRangeColorComponentValue ?? 0) > 1.0 {
+                appliedCapped = true
+            }
         }
     }
 
@@ -473,6 +487,12 @@ class XDRApp: NSObject, NSApplicationDelegate, ObservableObject {
         triggerView = view
 
         applyGamma()
+        // The display only enters EDR mode once the trigger has been composited, so the
+        // first table above is uncapped — re-check soon rather than waiting for the watchdog.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self = self, self.isActive else { return }
+            self.refreshGamma()
+        }
 
         isActive = true
         fputs("XDR ON — \(boostLevel)x (applied \(String(format: "%.2f", effectiveBoost))x)\n", stderr)
